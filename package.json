@@ -13,6 +13,7 @@
     "axios": "^1.7.9",
     "framer-motion": "^12.23.12",
     "lucide-react": "^0.468.0",
+    "mediasoup-client": "^3.17.1",
     "pako": "^2.1.0",
     "pdfjs-dist": "^3.4.120",
     "perfect-freehand": "^1.2.0",

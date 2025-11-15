@@ -33,7 +33,7 @@ function dataURLtoBlob(dataurl) {
 }
 
 export const connectWithSocketServer = (roomID, userID) => {
-  socket = io("https://sih-backend-2-sr15.onrender.com", {
+  socket = io("", {
     transports: ['websocket', 'polling'],
     timeout: 20000,
     reconnection: true,
@@ -43,26 +43,26 @@ export const connectWithSocketServer = (roomID, userID) => {
   console.log(`room ID from connect to socket : : ${roomID} : : ${userID}`);
 
   socket.on("connect", () => {
-    console.log("✅ Successfully connected to socket.io server");
+    console.log("Successfully connected to socket.io server");
     if (roomID && userID) {
       socket.emit("join-room", { userID, roomID });
     }
   });
 
   socket.on("connect_error", (error) => {
-    console.error("❌ Socket connection error:", error);
+    console.error("Socket connection error:", error);
   });
 
   socket.on("disconnect", (reason) => {
-    console.warn("⚠️ Socket disconnected:", reason);
+    console.warn("Socket disconnected:", reason);
   });
 
   socket.on("reconnect", (attemptNumber) => {
-    console.log("🔄 Socket reconnected after", attemptNumber, "attempts");
+    console.log("Socket reconnected after", attemptNumber, "attempts");
   });
 
   socket.on("reconnect_error", (error) => {
-    console.error("❌ Socket reconnection failed:", error);
+    console.error("Socket reconnection failed:", error);
   });
 
   socket.on("whiteboard-state", (data) => {
@@ -131,12 +131,12 @@ export const connectWithSocketServer = (roomID, userID) => {
           if (typeof msg.text === 'string') {
             const parsed = JSON.parse(msg.text);
             if (parsed.type === 'THEME_CHANGE') {
-              console.log("🎨 Theme change received via message system:", parsed.isDarkTheme ? "blackboard" : "whiteboard");
-              console.log("🔍 From user:", parsed.from);
+              console.log("Theme change received via message system:", parsed.isDarkTheme ? "blackboard" : "whiteboard");
+              console.log("From user:", parsed.from);
               
               const currentState = store.getState().whiteboard;
               if (currentState.isDarkTheme !== parsed.isDarkTheme) {
-                console.log("✅ Applying theme change via message system");
+                console.log("Applying theme change via message system");
                 store.dispatch(toggleTheme());
               }
               return true;

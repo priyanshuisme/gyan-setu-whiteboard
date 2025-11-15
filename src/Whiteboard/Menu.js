@@ -218,7 +218,7 @@ const Menu = ({ roomID, onEraserClick, onPencilClick, onFillClick }) => {
 
   const menuContainerStyle = {
     position: "fixed",
-    top: "70px", // Adjusted to avoid overlap with TopToolbar
+    top: "84px", // Adjusted to avoid overlap with TopToolbar
     left: "50%",
     transform: "translateX(-50%)",
     padding: expanded ? "6px 4px" : "6px 6px", // Minimal outer padding
@@ -239,7 +239,7 @@ const Menu = ({ roomID, onEraserClick, onPencilClick, onFillClick }) => {
     cursor: "pointer",
     width: "100%", // Fill container width
     minWidth: "160px", // Reduced minimum width
-    height: "32px", // Reduced height
+    height: "42px", // Reduced height
     alignItems: "center",
     fontWeight: theme.typography.fontWeight.semibold,
     fontSize: theme.typography.fontSize.sm, // Smaller font size

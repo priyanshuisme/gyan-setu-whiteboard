@@ -2,7 +2,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState, useCallback } from
 import { useDispatch, useSelector } from "react-redux";
 import rough from "roughjs/bundled/rough.esm";
 import { v4 as uuid } from "uuid";
-
+import { Redo2, Undo2 } from "lucide-react";
 // Enhanced Components
 import TopToolbar from "../components/TopToolbar";
 import ChatSidebar from "../components/ChatSidebar";
@@ -1491,7 +1491,7 @@ const Whiteboard = ({ role, userID, roomID }) => {
             }}
             title="Undo (Ctrl+Z)"
           >
-            ↶
+            <Undo2 />
           </button>
 
           <button
@@ -1527,7 +1527,7 @@ const Whiteboard = ({ role, userID, roomID }) => {
             }}
             title="Redo (Ctrl+Y)"
           >
-            ↷
+            <Redo2/>
           </button>
         </div>
       )}

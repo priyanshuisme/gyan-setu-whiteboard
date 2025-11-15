@@ -103,30 +103,19 @@ const TopToolbar = ({
             alignItems: 'center',
             gap: theme.spacing.md
           }}>
-            {/* Logo */}
-            <div style={{
-              width: '48px',
-              height: '48px',
-              borderRadius: theme.borderRadius.xl,
-              background: theme.colors.white,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              boxShadow: theme.shadow.md,
-              overflow: 'hidden',
-              border: '2px solid rgba(255, 255, 255, 0.2)'
-            }}>
-              <img 
-                src="/GyaanSetuIcon.jpeg" 
-                alt="GyaanSetu Logo" 
-                style={{
-                  width: '100%',
-                  height: '100%',
-                  objectFit: 'cover',
-                  borderRadius: theme.borderRadius.lg
-                }}
-              />
-            </div>
+            {/* Logo - Circular with no container */}
+            <img 
+              src="/GyaanSetu.png" 
+              alt="GyaanSetu Logo" 
+              style={{
+                width: '60px',
+                height: '60px',
+                borderRadius: '50%',
+                objectFit: 'cover',
+                boxShadow: theme.shadow.md,
+                
+              }}
+            />
             
             {/* App Info */}
             <div>
@@ -136,7 +125,7 @@ const TopToolbar = ({
                 fontWeight: theme.typography.fontWeight.semibold,
                 color: theme.colors.white
               }}>
-                Low bandwidth Whiteboard
+                Nav Shiksha
               </h3>
               <div style={{
                 display: 'flex',

@@ -4,62 +4,51 @@ import { connectWithSocketServer } from "../socketConn/socketConn";
 import Whiteboard from "./Whiteboard";
 import { useLocation } from "react-router-dom";
 import io from "socket.io-client";
+import * as mediasoupClient from "mediasoup-client";
 
-const AUDIO_SERVER_URL =
-  "https://audio-room-full-fina-sih-backend.onrender.com";
-
-// Socket.IO configuration with retry logic
-const socketConfig = {
-  timeout: 10000,
-  forceNew: true,
-  reconnection: true,
-  reconnectionDelay: 2000,
-  reconnectionAttempts: 5,
-  maxReconnectionAttempts: 10,
-  transports: ['websocket', 'polling'],
-  upgrade: true
-};
-
-const peerConfig = {
-  iceServers: [
-    { urls: "stun:stun.relay.metered.ca:80" },
-    {
-      urls: "turn:asia.relay.metered.ca:80",
-      username: "72f03df1b6a58f38d7fd81ab",
-      credential: "guctVzh/8qDU4KU0",
-    },
-    {
-      urls: "turn:asia.relay.metered.ca:80?transport=tcp",
-      username: "72f03df1b6a58f38d7fd81ab",
-      credential: "guctVzh/8qDU4KU0",
-    },
-    {
-      urls: "turn:asia.relay.metered.ca:443",
-      username: "72f03df1b6a58f38d7fd81ab",
-      credential: "guctVzh/8qDU4KU0",
-    },
-    {
-      urls: "turns:asia.relay.metered.ca:443?transport=tcp",
-      username: "72f03df1b6a58f38d7fd81ab",
-      credential: "guctVzh/8qDU4KU0",
-    },
-  ],
-};
+// ⚠️ CHANGE THIS to your deployed audio server URL
+const AUDIO_SERVER_URL = "http://localhost:5001";
 
 function WhiteboardPage() {
   const location = useLocation();
   const data = location.state;
   console.log(`from min wb page ${JSON.stringify(data)}`);
 
+  // Audio state for mediasoup
   const audioSocketRef = useRef(null);
-  const localStreamRef = useRef(null);
-  const peerConnectionsRef = useRef({});
+  const isCreatingTransportRef = useRef(false); // Prevent duplicate transport creation
+  const audioProducerRef = useRef(null); // Use ref to avoid stale closure issues
+  const consumedProducersRef = useRef(new Set()); // Track already consumed producers
+  const [device, setDevice] = useState(null);
+  const [producerTransport, setProducerTransport] = useState(null);
+  const [consumerTransports, setConsumerTransports] = useState({});
+  const [audioProducer, setAudioProducer] = useState(null);
+  const [audioConsumers, setAudioConsumers] = useState({});
   const [remoteStreams, setRemoteStreams] = useState({});
   const [usernames, setUsernames] = useState({});
   const [roles, setRoles] = useState({});
   const [isMuted, setIsMuted] = useState(false);
-  // Add this line with your other useState hooks
   const [isPanelOpen, setIsPanelOpen] = useState(false);
+  
+  // Recording state (automatic recording when teacher joins)
+  const [isRecording, setIsRecording] = useState(false);
+  
+  // MediaRecorder for client-side recording (teacher only)
+  const mediaRecorderRef = useRef(null);
+  const recordingChunksRef = useRef([]);
+  const teacherStreamRef = useRef(null);
+
+  // Debug: Expose audioProducer globally for testing
+  useEffect(() => {
+    if (audioProducer) {
+      window.audioProducer = audioProducer;
+      console.log('✅ Audio producer is now accessible via window.audioProducer');
+      console.log('   Current state - Paused:', audioProducer.paused, 'ID:', audioProducer.id);
+    } else {
+      window.audioProducer = null;
+      console.log('⏳ Audio producer not yet created');
+    }
+  }, [audioProducer]);
 
   useEffect(() => {
     connectWithSocketServer(data.roomID, data.userID);
@@ -67,214 +56,683 @@ function WhiteboardPage() {
   }, [data.roomID, data.userID]);
 
   useEffect(() => {
-    const joinRoom = async () => {
+    const initializeAudio = async () => {
       try {
-        console.log('🎤 Requesting microphone access...');
+        console.log('🎤 Initializing mediasoup audio system...');
         
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: { 
-            channelCount: 1, 
-            sampleRate: 16000, 
-            sampleSize: 16,
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
-          },
-          video: false,
+        // 1. Connect to media server
+        const socket = io(AUDIO_SERVER_URL, {
+          transports: ['websocket', 'polling'],
+          reconnection: true,
+          reconnectionDelay: 2000,
+          reconnectionAttempts: 5
         });
+        audioSocketRef.current = socket;
+
+        socket.on('connect', () => {
+          console.log('✅ Connected to media server:', AUDIO_SERVER_URL);
+          console.log('   Socket ID:', socket.id);
+        });
+
+        socket.on('connect_error', (error) => {
+          console.error('❌ Media server connection error:', error);
+          console.error('   Make sure backend is running at:', AUDIO_SERVER_URL);
+        });
+
+        socket.on('disconnect', (reason) => {
+          console.warn('⚠️ Disconnected from media server. Reason:', reason);
+        });
+
+        // Listen for generic errors
+        socket.on('error', (error) => {
+          console.error('❌ Socket error:', error);
+        });
+
+                // Listen for any event errors from server
+        socket.onAny((eventName, ...args) => {
+          console.log('📨 Event received:', eventName, args);
+        });
+
+        // IMPORTANT: Register all event listeners BEFORE joining room or requesting capabilities
+        // This ensures we don't miss any events that might be sent immediately
+
+        // 7. Handle new producer (someone started sending audio)
+        socket.on('newProducer', async ({ producerId, userId: producerUserId }) => {
+          console.log('═══════════════════════════════════════════');
+          console.log('🎵 NEW PRODUCER EVENT RECEIVED');
+          console.log('   Producer ID:', producerId);
+          console.log('   User ID:', producerUserId);
+          console.log('   Already consumed?', consumedProducersRef.current.has(producerId));
+          console.log('═══════════════════════════════════════════');
+          
+          // Check if we've already consumed this producer
+          if (consumedProducersRef.current.has(producerId)) {
+            console.log('⏭️ SKIPPING - Already consuming producer:', producerId);
+            return;
+          }
+          
+          const deviceToUse = socket.mediasoupDevice || device;
+          if (deviceToUse) {
+            console.log('✅ Starting consumption for producer:', producerId);
+            // Mark as being consumed
+            consumedProducersRef.current.add(producerId);
+            await consumeAudio(socket, deviceToUse, producerId, producerUserId);
+          } else {
+            console.warn('⚠️ Device not ready yet, cannot consume audio from:', producerUserId);
+          }
+        });
+
+        // Handle mute command from teacher
+        socket.on('muteCommand', ({ targetUserId }) => {
+          console.log('🔇 Received mute command for:', targetUserId, 'my ID:', data.userID);
+          const producer = audioProducerRef.current || window.audioProducer;
+          if (targetUserId === data.userID && producer) {
+            producer.pause();
+            setIsMuted(true);
+            console.log('🔇 Muted by teacher - Producer paused');
+          } else {
+            console.warn('⚠️ Cannot mute - targetUserId:', targetUserId, 'myId:', data.userID, 'producer:', !!producer);
+          }
+        });
+
+        // Handle unmute command from teacher
+        socket.on('unmuteCommand', ({ targetUserId }) => {
+          console.log('🔊 Received unmute command for:', targetUserId, 'my ID:', data.userID);
+          const producer = audioProducerRef.current || window.audioProducer;
+          if (targetUserId === data.userID && producer) {
+            producer.resume();
+            setIsMuted(false);
+            console.log('🔊 Unmuted by teacher - Producer resumed');
+          } else {
+            console.warn('⚠️ Cannot unmute - targetUserId:', targetUserId, 'myId:', data.userID, 'producer:', !!producer);
+          }
+        });
+
+        // 2. Get router RTP capabilities
+        console.log('📡 Requesting router RTP capabilities...');
+        socket.emit('getRouterRtpCapabilities');
         
-        localStreamRef.current = stream;
-        console.log('✅ Microphone access granted:', stream.getAudioTracks());
+        // Set a timeout to check if we get capabilities
+        const rtpTimeout = setTimeout(() => {
+          console.error('⏱️ TIMEOUT: No response for RTP capabilities after 10 seconds');
+        }, 10000);
         
+        socket.on('routerRtpCapabilities', async (rtpCapabilities) => {
+          clearTimeout(rtpTimeout);
+          try {
+            console.log('📡 Received router RTP capabilities');
+            console.log('   Codecs:', rtpCapabilities?.codecs?.length || 0);
+            
+            // 3. Load mediasoup Device
+            const newDevice = new mediasoupClient.Device();
+            await newDevice.load({ routerRtpCapabilities: rtpCapabilities });
+            setDevice(newDevice);
+            console.log('✅ Mediasoup device loaded');
+            
+            // Store device in socket for later use
+            socket.mediasoupDevice = newDevice;
+            
+            // 4. Join room (AFTER device is loaded and listeners are registered)
+            socket.emit('joinRoom', {
+              roomId: data.roomID,
+              userId: data.userID,
+              role: data.role
+            });
+            console.log('📡 Joining room:', data.roomID);
+            
+          } catch (error) {
+            console.error('❌ Error loading mediasoup device:', error);
+          }
+        });
+
+        // 5. Handle room joined
+        socket.on('roomJoined', async ({ users }) => {
+          console.log('✅ Room joined, users:', users);
+          
+          // Update usernames and roles
+          users.forEach(user => {
+            setUsernames(prev => ({ ...prev, [user.userId]: user.username || user.userId }));
+            setRoles(prev => ({ ...prev, [user.userId]: user.role }));
+          });
+          
+          // Create producer transport for sending audio
+          // Use device from socket if state device is not yet available
+          const deviceToUse = socket.mediasoupDevice || device;
+          if (deviceToUse) {
+            console.log('🚀 Creating producer transport with device');
+            await createProducerTransport(socket, deviceToUse);
+          } else {
+            console.error('❌ No device available to create producer transport');
+          }
+        });
+
+        // 6. Handle new user joined
+        socket.on('userJoined', async ({ userId, username, role }) => {
+          console.log('👤 New user joined:', userId, username, role);
+          setUsernames(prev => ({ ...prev, [userId]: username || userId }));
+          setRoles(prev => ({ ...prev, [userId]: role }));
+        });
+
+        // 8. Handle user left
+        socket.on('userLeft', ({ userId }) => {
+          console.log('� User left:', userId);
+          
+          // Clean up consumer transport
+          setConsumerTransports(prev => {
+            if (prev[userId]) {
+              prev[userId].close();
+            }
+            const { [userId]: _, ...rest } = prev;
+            return rest;
+          });
+          
+          // Clean up audio consumer
+          setAudioConsumers(prev => {
+            if (prev[userId]) {
+              prev[userId].close();
+            }
+            const { [userId]: _, ...rest } = prev;
+            return rest;
+          });
+          
+          // Remove remote stream
+          setRemoteStreams(prev => {
+            const { [userId]: _, ...rest } = prev;
+            return rest;
+          });
+          
+          // Remove username and role
+          setUsernames(prev => {
+            const { [userId]: _, ...rest } = prev;
+            return rest;
+          });
+          setRoles(prev => {
+            const { [userId]: _, ...rest } = prev;
+            return rest;
+          });
+        });
+
+        // Handle producer closed
+        socket.on('producerClosed', ({ producerId }) => {
+          console.log('🔴 Producer closed:', producerId);
+          // Remove from consumed producers tracking
+          consumedProducersRef.current.delete(producerId);
+        });
+
+        // 9. Recording events
+        socket.on('recordingStarted', ({ roomId, filename }) => {
+          setIsRecording(true);
+          console.log('🔴 Recording started automatically for room:', roomId);
+          console.log('   Filename:', filename);
+        });
+
+        socket.on('recordingStopped', ({ roomId, duration, fileSize }) => {
+          setIsRecording(false);
+          console.log('⏹️ Recording stopped. Duration:', duration, 'Size:', fileSize);
+        });
+
+        socket.on('classEnded', ({ roomId, teacherId, recording, timestamp }) => {
+          console.log('🏁 Class has been ended by teacher');
+          if (recording) {
+            alert(`Class has ended!\n\nRecording: ${recording.filename}\nDuration: ${Math.floor(recording.duration / 1000)}s`);
+          } else {
+            alert('Class has ended!');
+          }
+          // Redirect to home
+          setTimeout(() => {
+            window.location.href = '/';
+          }, 1000);
+        });
+
       } catch (error) {
-        console.error('❌ Microphone access denied:', error);
-        return;
+        console.error('❌ Error initializing audio:', error);
       }
-
-      console.log('🔌 Attempting connection to audio server:', AUDIO_SERVER_URL);
-      
-      const socket = io(AUDIO_SERVER_URL, socketConfig);
-      audioSocketRef.current = socket;
-      
-      // Track connection attempts
-      let connectionAttempts = 0;
-      const maxAttempts = 5;
-
-      socket.on("connect", () => {
-        connectionAttempts = 0; // Reset counter on successful connection
-        console.log('✅ Socket connected to audio server');
-        
-        socket.emit("join-room", {
-          roomId: data.roomID,
-          username: data.userID,
-          role: data.role,
-        });
-        
-        console.log('📡 Joining room:', { roomId: data.roomID, username: data.userID, role: data.role });
-      });
-      
-      socket.on("disconnect", (reason) => {
-        console.log('❌ Socket disconnected:', reason);
-      });
-      
-      socket.on("connect_error", (error) => {
-        connectionAttempts++;
-        console.error(`❌ Socket connection error (attempt ${connectionAttempts}/${maxAttempts}):`, error);
-        
-        if (connectionAttempts >= maxAttempts) {
-          console.error('🚫 Max connection attempts reached. Audio features disabled.');
-        }
-      });
-      
-      socket.on("reconnect", (attemptNumber) => {
-        console.log(`🔄 Socket reconnected after ${attemptNumber} attempts`);
-      });
-      
-      socket.on("reconnect_error", (error) => {
-        console.error('❌ Reconnection failed:', error);
-      });
-      
-      socket.on("reconnect_failed", () => {
-        console.error('🚫 All reconnection attempts failed');
-      });
-
-      socket.on("all-users", (users) => {
-        console.log('👥 All users received:', users);
-        
-        users.forEach(({ userId, username: uname, role: urole }) => {
-          setUsernames((prev) => ({ ...prev, [userId]: uname }));
-          setRoles((prev) => ({ ...prev, [userId]: urole }));
-          const pc = createPeerConnection(userId, true);
-          peerConnectionsRef.current[userId] = pc;
-          console.log(`📞 Created peer connection for ${uname} (${urole})`);
-        });
-      });
-
-      socket.on("user-joined", ({ userId, username: uname, role: urole }) => {
-        setUsernames((prev) => ({ ...prev, [userId]: uname }));
-        setRoles((prev) => ({ ...prev, [userId]: urole }));
-        const pc = createPeerConnection(userId, false);
-        peerConnectionsRef.current[userId] = pc;
-      });
-
-      socket.on("offer", async ({ sdp, sender }) => {
-        const pc = createPeerConnection(sender, false);
-        peerConnectionsRef.current[sender] = pc;
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit("answer", { target: sender, sdp: pc.localDescription });
-      });
-
-      socket.on("answer", async ({ sdp, sender }) => {
-        const pc = peerConnectionsRef.current[sender];
-        if (pc) {
-          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-        }
-      });
-
-      socket.on("ice-candidate", async ({ candidate, sender }) => {
-        const pc = peerConnectionsRef.current[sender];
-        if (pc && candidate) {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        }
-      });
-
-      socket.on("user-left", (userId) => {
-        const pc = peerConnectionsRef.current[userId];
-        if (pc) {
-          pc.close();
-          delete peerConnectionsRef.current[userId];
-        }
-        setRemoteStreams((prev) => {
-          const { [userId]: _, ...rest } = prev;
-          return rest;
-        });
-        setUsernames((prev) => {
-          const { [userId]: _, ...rest } = prev;
-          return rest;
-        });
-        setRoles((prev) => {
-          const { [userId]: _, ...rest } = prev;
-          return rest;
-        });
-      });
-
-      socket.on("mute", () => {
-        localStreamRef.current.getAudioTracks().forEach((track) => {
-          track.enabled = false;
-        });
-        setIsMuted(true);
-      });
-
-      socket.on("unmute", () => {
-        localStreamRef.current.getAudioTracks().forEach((track) => {
-          track.enabled = true;
-        });
-        setIsMuted(false);
-      });
     };
 
-    const createPeerConnection = (userId, isOffer) => {
-      const pc = new RTCPeerConnection(peerConfig);
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current);
-      });
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          audioSocketRef.current.emit("ice-candidate", {
-            target: userId,
-            candidate: event.candidate,
-          });
-        }
-      };
-
-      pc.ontrack = (event) => {
-        const stream = event.streams[0];
-        console.log(`🎵 Received remote stream from ${userId}:`, stream);
-        console.log('  - Active:', stream.active);
-        console.log('  - Audio tracks:', stream.getAudioTracks().length);
-        
-        setRemoteStreams((prev) => ({ ...prev, [userId]: stream }));
-      };
-
-      if (isOffer) {
-        pc.onnegotiationneeded = async () => {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          audioSocketRef.current.emit("offer", {
-            target: userId,
-            sdp: pc.localDescription,
-          });
-        };
-      }
-      return pc;
-    };
-
-    joinRoom();
+    initializeAudio();
 
     return () => {
+      console.log('🧹 Cleaning up audio connections...');
+      
+      // Close producer transport
+      if (producerTransport) {
+        producerTransport.close();
+      }
+      
+      // Close all consumer transports
+      Object.values(consumerTransports).forEach(transport => {
+        transport.close();
+      });
+      
+      // Close audio producer
+      if (audioProducer) {
+        audioProducer.close();
+      }
+      
+      // Close all audio consumers
+      Object.values(audioConsumers).forEach(consumer => {
+        consumer.close();
+      });
+      
+      // Disconnect socket
       if (audioSocketRef.current) {
+        audioSocketRef.current.emit('leaveRoom', {
+          roomId: data.roomID,
+          userId: data.userID
+        });
         audioSocketRef.current.disconnect();
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data.roomID, data.userID, data.role]);
 
-  const toggleMute = () => {
-    localStreamRef.current.getAudioTracks().forEach((track) => {
-      track.enabled = !track.enabled;
-    });
-    setIsMuted((prev) => !prev);
+  // Create producer transport (for sending audio)
+  const createProducerTransport = async (socket, mediasoupDevice) => {
+    try {
+      // Check if already creating or transport already exists
+      if (isCreatingTransportRef.current || producerTransport) {
+        console.log('⚠️ Producer transport already exists or is being created, skipping');
+        return;
+      }
+
+      // Set flag to prevent duplicate creation
+      isCreatingTransportRef.current = true;
+
+      console.log('🚀 Creating producer transport...');
+      console.log('   Room ID:', data.roomID);
+      console.log('   User ID:', data.userID);
+      console.log('   Device available:', !!mediasoupDevice);
+      
+      // Request transport creation from server
+      socket.emit('createWebRtcTransport', {
+        roomId: data.roomID,
+        userId: data.userID,
+        isProducer: true
+      });
+      console.log('📡 Emitted createWebRtcTransport event');
+
+      // Set a timeout to check if we receive the response
+      const timeout = setTimeout(() => {
+        console.error('⏱️ TIMEOUT: No response from server after 10 seconds');
+        console.error('   This usually means:');
+        console.error('   1. Backend is not running');
+        console.error('   2. Backend is not handling "createWebRtcTransport" event');
+        console.error('   3. Network connectivity issue');
+      }, 10000);
+
+      socket.once('transportCreated', async ({ transport: transportOptions }) => {
+        clearTimeout(timeout);
+        try {
+          console.log('✅ Producer transport created:', transportOptions.id);
+          
+          // Create send transport
+          const transport = mediasoupDevice.createSendTransport(transportOptions);
+          setProducerTransport(transport);
+
+          // Handle transport connection
+          transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+            try {
+              socket.emit('connectTransport', {
+                transportId: transport.id,
+                dtlsParameters
+              });
+              socket.once('transportConnected', () => {
+                console.log('✅ Producer transport connected');
+                callback();
+              });
+            } catch (error) {
+              console.error('❌ Error connecting transport:', error);
+              errback(error);
+            }
+          });
+
+          // Handle produce
+          transport.on('produce', async ({ kind, rtpParameters }, callback, errback) => {
+            try {
+              socket.emit('produce', {
+                transportId: transport.id,
+                kind,
+                rtpParameters,
+                roomId: data.roomID,
+                userId: data.userID
+              });
+              socket.once('produced', ({ id }) => {
+                console.log('✅ Audio produced with ID:', id);
+                callback({ id });
+              });
+            } catch (error) {
+              console.error('❌ Error producing:', error);
+              errback(error);
+            }
+          });
+
+          // Get microphone stream and produce
+          console.log('🎤 Requesting microphone access...');
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+              sampleRate: 8000,
+              channelCount: 1
+            }
+          });
+          
+          console.log('🎤 Got microphone access, tracks:', stream.getAudioTracks().length);
+          const audioTrack = stream.getAudioTracks()[0];
+          console.log('🎵 Audio track details:', {
+            id: audioTrack.id,
+            kind: audioTrack.kind,
+            enabled: audioTrack.enabled,
+            muted: audioTrack.muted,
+            readyState: audioTrack.readyState
+          });
+          
+          // Store stream for teacher (for MediaRecorder)
+          teacherStreamRef.current = stream;
+          
+          // Start MediaRecorder if teacher
+          if (data.role === 'teacher') {
+            startRecording(stream);
+          }
+          
+          const producer = await transport.produce({ track: audioTrack });
+          setAudioProducer(producer);
+          audioProducerRef.current = producer; // Store in ref for event handlers
+          console.log('✅ Audio producer created successfully!');
+          console.log('   Producer ID:', producer.id);
+          console.log('   Producer paused:', producer.paused);
+          console.log('   Producer track:', producer.track);
+          console.log('🎉 You can now test mute/unmute in console: window.audioProducer');
+          
+          // Reset flag after successful creation
+          isCreatingTransportRef.current = false;
+          
+        } catch (error) {
+          console.error('❌ Error setting up producer transport:', error);
+          isCreatingTransportRef.current = false; // Reset flag on error
+        }
+      });
+    } catch (error) {
+      console.error('❌ Error creating producer transport:', error);
+      isCreatingTransportRef.current = false; // Reset flag on error
+    }
   };
 
+  // Consume audio from another user
+  const consumeAudio = async (socket, mediasoupDevice, producerId, producerUserId) => {
+    try {
+      console.log('🎧 Consuming audio from producer:', producerId);
+      
+      // Request consumer transport creation
+      socket.emit('createWebRtcTransport', {
+        roomId: data.roomID,
+        userId: data.userID,
+        isProducer: false
+      });
+
+      socket.once('consumerTransportCreated', async ({ transport: transportOptions }) => {
+        try {
+          console.log('✅ Consumer transport created:', transportOptions.id);
+          
+          // Create receive transport
+          const transport = mediasoupDevice.createRecvTransport(transportOptions);
+          setConsumerTransports(prev => ({ ...prev, [producerUserId]: transport }));
+
+          // Handle transport connection
+          transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+            try {
+              socket.emit('connectTransport', {
+                transportId: transport.id,
+                dtlsParameters
+              });
+              socket.once('transportConnected', () => {
+                console.log('✅ Consumer transport connected');
+                callback();
+              });
+            } catch (error) {
+              console.error('❌ Error connecting consumer transport:', error);
+              errback(error);
+            }
+          });
+
+          // Request to consume audio
+          socket.emit('consume', {
+            transportId: transport.id,
+            producerId: producerId,
+            rtpCapabilities: mediasoupDevice.rtpCapabilities,
+            roomId: data.roomID,
+            userId: data.userID
+          });
+
+          socket.once('consumed', async ({ consumer: consumerOptions }) => {
+            try {
+              console.log('═══════════════════════════════════════════');
+              console.log('✅ CONSUMED EVENT RECEIVED');
+              console.log('   Consumer ID:', consumerOptions.id);
+              console.log('   Producer User ID:', producerUserId);
+              console.log('═══════════════════════════════════════════');
+              
+              const consumer = await transport.consume(consumerOptions);
+              setAudioConsumers(prev => ({ ...prev, [producerUserId]: consumer }));
+              
+              // Create audio stream and play
+              const stream = new MediaStream([consumer.track]);
+              setRemoteStreams(prev => ({ ...prev, [producerUserId]: stream }));
+              
+              console.log('═══════════════════════════════════════════');
+              console.log('🔊 AUDIO STREAM CREATED FOR USER:', producerUserId);
+              console.log('   Stream ID:', stream.id);
+              console.log('   Stream tracks:', stream.getTracks().length);
+              console.log('   Track ID:', consumer.track.id);
+              console.log('   Track kind:', consumer.track.kind);
+              console.log('   Track enabled:', consumer.track.enabled);
+              console.log('   Track muted:', consumer.track.muted);
+              console.log('   Track readyState:', consumer.track.readyState);
+              console.log('   Consumer paused:', consumer.paused);
+              console.log('   Stream active:', stream.active);
+              console.log('═══════════════════════════════════════════');
+              
+              // Store in window for debugging
+              window.latestConsumer = consumer;
+              window.latestStream = stream;
+              window[`consumer_${producerUserId}`] = consumer;
+              window[`stream_${producerUserId}`] = stream;
+              
+              // Resume consumer (in case it was paused)
+              socket.emit('resumeConsumer', {
+                consumerId: consumer.id,
+                roomId: data.roomID
+              });
+              console.log('📡 Emitted resumeConsumer for:', consumer.id);
+            } catch (error) {
+              console.error('❌ Error consuming audio:', error);
+            }
+          });
+        } catch (error) {
+          console.error('❌ Error setting up consumer transport:', error);
+        }
+      });
+    } catch (error) {
+      console.error('❌ Error consuming audio:', error);
+    }
+  };
+
+  // Toggle mute
+  const toggleMute = () => {
+    const producer = audioProducerRef.current || audioProducer;
+    console.log('🎙️ Toggle mute clicked. Current audioProducer:', producer);
+    
+    if (!producer) {
+      console.warn('⚠️ No audio producer available yet. Please wait for audio to initialize.');
+      return;
+    }
+    
+    try {
+      if (producer.paused) {
+        producer.resume();
+        setIsMuted(false);
+        console.log('🔊 Unmuted - Audio producer resumed');
+      } else {
+        producer.pause();
+        setIsMuted(true);
+        console.log('🔇 Muted - Audio producer paused');
+      }
+    } catch (error) {
+      console.error('❌ Error toggling mute:', error);
+    }
+  };
+
+  // Start MediaRecorder recording (client-side)
+  const startRecording = (stream) => {
+    try {
+      console.log('🎬 Starting MediaRecorder...');
+      
+      // Check browser support
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+        ? 'audio/webm;codecs=opus' 
+        : 'audio/webm';
+      
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType,
+        audioBitsPerSecond: 32000 // 32 kbps
+      });
+      
+      mediaRecorderRef.current = mediaRecorder;
+      recordingChunksRef.current = [];
+      
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordingChunksRef.current.push(event.data);
+          console.log(`📦 Chunk received: ${(event.data.size / 1024).toFixed(1)} KB`);
+        }
+      };
+      
+      mediaRecorder.onstop = async () => {
+        console.log('⏹️ MediaRecorder stopped');
+        const blob = new Blob(recordingChunksRef.current, { type: mimeType });
+        console.log(`📦 Total recording size: ${(blob.size / 1024).toFixed(1)} KB`);
+        
+        // Upload to backend
+        await uploadRecording(blob);
+        
+        // Clean up
+        recordingChunksRef.current = [];
+      };
+      
+      mediaRecorder.onerror = (event) => {
+        console.error('❌ MediaRecorder error:', event.error);
+      };
+      
+      // Start recording (collect data every 5 seconds)
+      mediaRecorder.start(5000);
+      setIsRecording(true);
+      console.log('✅ MediaRecorder started');
+      console.log('   MIME type:', mimeType);
+      console.log('   Bitrate: 32 kbps');
+      
+    } catch (error) {
+      console.error('❌ Error starting MediaRecorder:', error);
+    }
+  };
+  
+  // Stop MediaRecorder recording
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      console.log('⏹️ Stopping MediaRecorder...');
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+    }
+  };
+  
+  // Upload recording to backend
+  const uploadRecording = async (blob) => {
+    try {
+      console.log('📤 Uploading recording...');
+      
+      const formData = new FormData();
+      formData.append('recording', blob, `room-${data.roomID}-${new Date().toISOString()}.webm`);
+      formData.append('roomId', data.roomID);
+      formData.append('userId', data.userID);
+      
+      const response = await fetch(`${AUDIO_SERVER_URL}/upload-recording`, {
+        method: 'POST',
+        body: formData
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        console.log('✅ Recording uploaded:', result.filename);
+        return result;
+      } else {
+        const error = await response.text();
+        console.error('❌ Upload failed:', error);
+        throw new Error(error);
+      }
+    } catch (error) {
+      console.error('❌ Error uploading recording:', error);
+      throw error;
+    }
+  };
+
+  // End Class - Stops recording and closes the room
+  const handleEndClass = () => {
+    if (data.role !== 'teacher') return;
+    
+    if (!audioSocketRef.current) {
+      alert('Audio connection not established. Please refresh the page.');
+      return;
+    }
+    
+    const confirmed = window.confirm(
+      'Are you sure you want to end the class?\n\nThis will:\n• Stop the recording\n• Close the room\n• Disconnect all participants'
+    );
+    
+    if (!confirmed) return;
+    
+    console.log('🏁 Ending class...');
+    
+    // Stop MediaRecorder if running
+    stopRecording();
+    
+    audioSocketRef.current.emit('endClass', { roomId: data.roomID }, (response) => {
+      if (response && response.success) {
+        console.log('✅ Class ended successfully');
+        if (response.recording) {
+          alert(`Class ended!\n\nRecording saved: ${response.recording.filename}\nDuration: ${Math.floor(response.recording.duration / 1000)}s`);
+        }
+        // Redirect to home or dashboard
+        window.location.href = '/';
+      } else {
+        console.error('❌ Error ending class:', response?.error);
+        alert('Failed to end class: ' + (response?.error || 'Unknown error'));
+      }
+    });
+  };
+
+  // Mute/Unmute student (teacher only)
   const handleMuteStudent = (userId) => {
-    audioSocketRef.current.emit("mute-student", { target: userId });
+    if (data.role !== 'teacher') return;
+    if (!audioSocketRef.current) {
+      console.warn('Audio socket not connected');
+      return;
+    }
+    audioSocketRef.current.emit('muteStudent', { 
+      roomId: data.roomID,
+      targetUserId: userId 
+    });
   };
 
   const handleUnmuteStudent = (userId) => {
-    audioSocketRef.current.emit("unmute-student", { target: userId });
+    if (data.role !== 'teacher') return;
+    if (!audioSocketRef.current) {
+      console.warn('Audio socket not connected');
+      return;
+    }
+    audioSocketRef.current.emit('unmuteStudent', { 
+      roomId: data.roomID,
+      targetUserId: userId 
+    });
   };
 
   return (
@@ -350,7 +808,79 @@ function WhiteboardPage() {
             </button>
           </div>
 
-          {/* Participants List (No changes inside this div) */}
+          {/* Recording Status - All Users */}
+          {isRecording && (
+            <div style={{
+              padding: '10px 15px',
+              borderBottom: '1px solid #f0f0f0',
+              backgroundColor: '#fff3cd',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px'
+            }}>
+              <span style={{
+                width: '12px',
+                height: '12px',
+                backgroundColor: '#dc3545',
+                borderRadius: '50%',
+                display: 'inline-block',
+                animation: 'pulse 1.5s ease-in-out infinite'
+              }}></span>
+              <span style={{ fontSize: '14px', fontWeight: '600', color: '#856404' }}>
+                🎙️ Recording in progress...
+              </span>
+            </div>
+          )}
+
+          {/* End Class Button - Teacher Only */}
+          {data.role === 'teacher' && (
+            <div style={{
+              padding: '10px 15px',
+              borderBottom: '1px solid #f0f0f0',
+              backgroundColor: '#f9f9f9'
+            }}>
+              <button
+                onClick={handleEndClass}
+                style={{
+                  width: '100%',
+                  padding: '12px 16px',
+                  borderRadius: '5px',
+                  border: '1px solid #dc3545',
+                  backgroundColor: '#dc3545',
+                  color: 'white',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                  fontWeight: '600',
+                  transition: 'all 0.2s',
+                  boxShadow: '0 2px 4px rgba(220, 53, 69, 0.2)'
+                }}
+                onMouseEnter={(e) => {
+                  e.target.style.backgroundColor = '#c82333';
+                  e.target.style.transform = 'translateY(-1px)';
+                  e.target.style.boxShadow = '0 4px 8px rgba(220, 53, 69, 0.3)';
+                }}
+                onMouseLeave={(e) => {
+                  e.target.style.backgroundColor = '#dc3545';
+                  e.target.style.transform = 'translateY(0)';
+                  e.target.style.boxShadow = '0 2px 4px rgba(220, 53, 69, 0.2)';
+                }}
+              >
+                🏁 End Class
+              </button>
+              <p style={{ 
+                margin: '8px 0 0 0', 
+                fontSize: '11px', 
+                color: '#666',
+                textAlign: 'center'
+              }}>
+                Stops recording and closes the room
+              </p>
+            </div>
+          )}
+
+
+
+          {/* Participants List */}
           <div style={{ overflowY: "auto", padding: "10px 15px" }}>
             {/* Your Own Controls */}
             <div
@@ -364,23 +894,33 @@ function WhiteboardPage() {
             >
               <p style={{ margin: 0, fontWeight: "bold" }}>
                 You ({data.userID})
+                {audioProducer && <span style={{ marginLeft: '8px', fontSize: '12px', color: '#5cb85c' }}>🎤</span>}
               </p>
               <button
                 onClick={toggleMute}
+                disabled={!audioProducer}
                 style={{
                   padding: "5px 12px",
                   borderRadius: "5px",
                   border: isMuted ? "1px solid #ccc" : "1px solid #d9534f",
-                  backgroundColor: isMuted ? "#f0f0f0" : "#d9534f",
-                  color: isMuted ? "#333" : "white",
-                  cursor: "pointer",
+                  backgroundColor: !audioProducer ? '#ddd' : (isMuted ? "#f0f0f0" : "#d9534f"),
+                  color: !audioProducer ? '#999' : (isMuted ? "#333" : "white"),
+                  cursor: !audioProducer ? 'not-allowed' : "pointer",
+                  opacity: !audioProducer ? 0.6 : 1,
                 }}
+                title={!audioProducer ? 'Waiting for audio to initialize...' : (isMuted ? 'Click to unmute' : 'Click to mute')}
               >
-                {isMuted ? "Unmute" : "Mute"}
+                {isMuted ? "🔇 Unmute" : "🎤 Mute"}
               </button>
             </div>
 
             {/* Remote Participants */}
+            {(() => {
+              console.log('🎨 RENDERING REMOTE PARTICIPANTS');
+              console.log('   Number of streams:', Object.keys(remoteStreams).length);
+              console.log('   Stream IDs:', Object.keys(remoteStreams));
+              return null;
+            })()}
             {Object.entries(remoteStreams).map(([id, stream]) => (
               <div
                 key={id}
@@ -407,7 +947,25 @@ function WhiteboardPage() {
                   autoPlay
                   playsInline
                   ref={(el) => {
-                    if (el) el.srcObject = stream;
+                    if (el && el.srcObject !== stream) {
+                      console.log(`🔊 Attaching audio element for user ${id}`);
+                      console.log('   Stream:', stream);
+                      console.log('   Stream tracks:', stream.getTracks());
+                      console.log('   Stream active:', stream.active);
+                      
+                      el.srcObject = stream;
+                      el.volume = 1.0;
+                      
+                      // Explicitly play the audio (handle autoplay policy)
+                      el.play()
+                        .then(() => {
+                          console.log(`✅ Audio playing for user ${id}`);
+                        })
+                        .catch(err => {
+                          console.warn(`⚠️ Audio autoplay prevented for user ${id}:`, err);
+                          console.log('👆 User interaction may be required to start audio');
+                        });
+                    }
                   }}
                   style={{ display: "none" }}
                 />
@@ -465,10 +1023,9 @@ function WhiteboardPage() {
             cursor: "pointer",
             boxShadow: "0 4px 8px rgba(0,0,0,0.2)",
             fontSize: "12px",
-            position: "absolute", // Positioned within the container
+            position: "absolute", 
             bottom: 0,
             right: 0,
-            // Transition and conditional styles for the dot
             transition: "opacity 300ms ease, transform 300ms ease",
             transformOrigin: "bottom right",
             opacity: isPanelOpen ? 0 : 1,
